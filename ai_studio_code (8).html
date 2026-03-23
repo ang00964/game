@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <title>監獄迷宮：特種行動 V2</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: 'Courier New', monospace; overflow: hidden; }
+        canvas { display: block; }
+        
+        /* UI 層 */
+        #hud {
+            position: fixed; top: 20px; left: 20px; z-index: 100;
+            background: rgba(0,0,0,0.8); padding: 15px; border: 2px solid #555;
+            pointer-events: none;
+        }
+        .bar-container { width: 180px; height: 10px; background: #333; margin: 5px 0; border: 1px solid #777; }
+        #stamina-fill { width: 100%; height: 100%; background: #2ecc71; }
+        #hp-fill { width: 100%; height: 100%; background: #e74c3c; }
+        .ammo-text { font-size: 22px; color: #f1c40f; font-weight: bold; }
+
+        /* 遊戲結束/開始 遮罩 */
+        .overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.95); display: flex; flex-direction: column;
+            align-items: center; justify-content: center; z-index: 1000; text-align: center;
+        }
+        .btn {
+            padding: 15px 40px; font-size: 1.5rem; background: #222; color: #00ccff;
+            border: 2px solid #00ccff; cursor: pointer; margin-top: 20px;
+        }
+        .btn:hover { background: #00ccff; color: #000; }
+    </style>
+</head>
+<body>
+
+<div id="start-screen" class="overlay">
+    <h1 style="color: #00ccff;">監獄迷宮：特種行動</h1>
+    <p>● <b>WASD</b> 移動 | <b>SHIFT</b> 奔跑 (1.5秒) | <b>左鍵</b> 射擊<br>
+       ● 彈藥上限: <b>10發</b> | 體力恢復: <b>3秒</b><br>
+       ● <b>草叢</b> 可躲避 | <b>小地圖</b> 在右上角</p>
+    <button class="btn" onclick="startGame()">開始滲透</button>
+</div>
+
+<div id="end-screen" class="overlay" style="display:none;">
+    <h1 id="end-title">任務結束</h1>
+    <p id="end-msg"></p>
+    <button class="btn" onclick="location.reload()">重新啟動</button>
+</div>
+
+<div id="hud">
+    <div class="ammo-text">AMMO: <span id="ammo-val">0</span>/10</div>
+    <div style="font-size: 12px; margin-top:5px;">STAMINA (體力)</div>
+    <div class="bar-container"><div id="stamina-fill"></div></div>
+    <div style="font-size: 12px;">HEALTH (生命)</div>
+    <div class="bar-container"><div id="hp-fill"></div></div>
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// --- 遊戲世界設定 ---
+const WORLD = { width: 3600, height: 2800 };
+let VIEW = { width: window.innerWidth, height: window.innerHeight };
+const camera = { x: 0, y: 0 };
+let gameActive = false;
+
+// --- 物件定義 ---
+const player = {
+    x: 100, y: 100, r: 14, hp: 5, ammo: 0, 
+    stamina: 90, maxStamina: 90, tired: false, sprinting: false,
+    angle: 0, hasGun: false
+};
+
+const walls = [];
+const bushes = [];
+const enemies = [];
+const bullets = [];
+const ammoBoxes = [];
+const weaponBox = { x: 300, y: 300, picked: false };
+const exitGate = { x: 3400, y: 2600, w: 150, h: 150 };
+
+// --- 監聽事件 ---
+const keys = {};
+window.addEventListener('keydown', e => keys[e.code] = true);
+window.addEventListener('keyup', e => keys[e.code] = false);
+let mouse = { x: 0, y: 0 };
+window.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+window.addEventListener('mousedown', () => { if(gameActive && player.hasGun && player.ammo > 0) shoot(player, 'blue'); });
+
+// --- 地圖生成 (迷宮邏輯) ---
+function createMap() {
+    const cellSize = 400;
+    // 基礎邊界
+    walls.push({x:0, y:0, w:WORLD.width, h:30}, {x:0, y:WORLD.height-30, w:WORLD.width, h:30});
+    walls.push({x:0, y:0, w:30, h:WORLD.height}, {x:WORLD.width-30, y:0, w:30, h:WORLD.height});
+
+    // 生成迷宮牆壁
+    for(let i=1; i < WORLD.width/cellSize; i++) {
+        for(let j=1; j < WORLD.height/cellSize; j++) {
+            let x = i * cellSize;
+            let y = j * cellSize;
+            let isVert = Math.random() > 0.5;
+            let ww = isVert ? 30 : cellSize + 30;
+            let wh = isVert ? cellSize + 30 : 30;
+            walls.push({x, y, w: ww, h: wh});
+            
+            // 直式草叢貼著牆
+            if(isVert) {
+                bushes.push({x: x-15, y, w: 15, h: wh});
+                bushes.push({x: x+30, y, w: 15, h: wh});
+            }
+        }
+    }
+
+    // 隨機物資
+    for(let i=0; i<15; i++) ammoBoxes.push({x: Math.random()*3200+200, y: Math.random()*2400+200, used: false});
+    
+    // 生成敵人
+    for(let i=0; i<18; i++) {
+        enemies.push({
+            x: Math.random()*3000+400, y: Math.random()*2400+200,
+            hp: 5, angle: 0, speed: 2, range: 400, lastShot: 0,
+            path: [{x:0,y:0}, {x:0,y:0}], pIdx: 0
+        });
+        enemies[i].path = [{x: enemies[i].x, y: enemies[i].y}, {x: enemies[i].x + (Math.random()-0.5)*600, y: enemies[i].y + (Math.random()-0.5)*600}];
+    }
+}
+
+function startGame() {
+    document.getElementById('start-screen').style.display = 'none';
+    createMap();
+    gameActive = true;
+    requestAnimationFrame(loop);
+}
+
+// --- 更新邏輯 ---
+function update() {
+    if(!gameActive) return;
+
+    // 1. 體力與奔跑 (1.5s 消耗, 3s 恢復)
+    player.sprinting = keys['ShiftLeft'] && !player.tired && (keys['KeyW'] || keys['KeyS'] || keys['KeyA'] || keys['KeyD']);
+    if(player.sprinting) {
+        player.stamina -= 1;
+        if(player.stamina <= 0) player.tired = true;
+    } else {
+        if(player.stamina < player.maxStamina) player.stamina += 0.5; // 恢復比消耗慢一倍
+        if(player.stamina >= player.maxStamina) player.tired = false;
+    }
+
+    // 2. 移動與碰撞
+    let spd = player.sprinting ? 7 : 3.5;
+    let dx = 0, dy = 0;
+    if(keys['KeyW']) dy -= spd; if(keys['KeyS']) dy += spd;
+    if(keys['KeyA']) dx -= spd; if(keys['KeyD']) dx += spd;
+
+    if(!checkWall(player.x + dx, player.y, player.r)) player.x += dx;
+    if(!checkWall(player.x, player.y + dy, player.r)) player.y += dy;
+
+    // 3. 攝影機跟隨
+    camera.x = player.x - VIEW.width/2;
+    camera.y = player.y - VIEW.height/2;
+    camera.x = Math.max(0, Math.min(camera.x, WORLD.width - VIEW.width));
+    camera.y = Math.max(0, Math.min(camera.y, WORLD.height - VIEW.height));
+
+    // 4. 角度與隱蔽偵測
+    player.angle = Math.atan2(mouse.y - (player.y - camera.y), mouse.x - (player.x - camera.x));
+    let inBush = bushes.some(b => player.x > b.x && player.x < b.x+b.w && player.y > b.y && player.y < b.y+b.h);
+
+    // 5. 拾取物資
+    if(!weaponBox.picked && Math.hypot(player.x-weaponBox.x, player.y-weaponBox.y) < 40) { weaponBox.picked = true; player.hasGun = true; player.ammo = 10; }
+    ammoBoxes.forEach(a => { if(!a.used && Math.hypot(player.x-a.x, player.y-a.y) < 30) { a.used = true; player.ammo = Math.min(10, player.ammo + 5); }});
+
+    // 6. 子彈與戰鬥
+    for(let i=bullets.length-1; i>=0; i--) {
+        let b = bullets[i];
+        b.x += Math.cos(b.angle) * 16;
+        b.y += Math.sin(b.angle) * 16;
+        if(checkWall(b.x, b.y, 2)) { bullets.splice(i,1); continue; }
+        if(b.side === 'blue') {
+            enemies.forEach(en => { if(Math.hypot(b.x-en.x, b.y-en.y) < 20) { en.hp--; bullets.splice(i,1); }});
+        } else {
+            if(Math.hypot(b.x-player.x, b.y-player.y) < 15) { player.hp--; bullets.splice(i,1); }
+        }
+    }
+
+    // 7. 敵人 AI
+    enemies.forEach((en, idx) => {
+        let d = Math.hypot(player.x-en.x, player.y-en.y);
+        let canSee = d < en.range && !inBush && !isLineBlocked(en.x, en.y, player.x, player.y);
+        if(canSee) {
+            en.angle = Math.atan2(player.y-en.y, player.x-en.x);
+            if(Date.now() - en.lastShot > 1000) { shoot(en, 'red'); en.lastShot = Date.now(); }
+        } else {
+            let t = en.path[en.pIdx];
+            en.angle = Math.atan2(t.y-en.y, t.x-en.x);
+            en.x += Math.cos(en.angle) * en.speed;
+            en.y += Math.sin(en.angle) * en.speed;
+            if(Math.hypot(t.x-en.x, t.y-en.y) < 5) en.pIdx = (en.pIdx+1) % en.path.length;
+        }
+        if(en.hp <= 0) enemies.splice(idx, 1);
+    });
+
+    // 更新 HUD
+    document.getElementById('stamina-fill').style.width = (player.stamina/90*100) + "%";
+    document.getElementById('stamina-fill').style.background = player.tired ? "#e74c3c" : "#2ecc71";
+    document.getElementById('hp-fill').style.width = (player.hp/5*100) + "%";
+    document.getElementById('ammo-val').innerText = player.ammo;
+
+    if(player.hp <= 0) endGame("你已陣亡", "警衛火力過強，滲透失敗。");
+    if(player.x > exitGate.x && player.y > exitGate.y) endGame("逃脫成功", "你已通過監獄大門。");
+}
+
+function shoot(who, side) {
+    if(side === 'blue') player.ammo--;
+    bullets.push({ x: who.x, y: who.y, angle: who.angle, side: side });
+}
+
+// --- 繪製畫布 ---
+function draw() {
+    ctx.clearRect(0, 0, VIEW.width, VIEW.height);
+    ctx.save();
+    ctx.translate(-camera.x, -camera.y);
+
+    // 1. 草叢
+    ctx.fillStyle = '#0a1a0a';
+    bushes.forEach(b => ctx.fillRect(b.x, b.y, b.w, b.h));
+
+    // 2. 出口大門
+    ctx.strokeStyle = '#7f8c8d'; ctx.lineWidth = 8;
+    ctx.strokeRect(exitGate.x, exitGate.y, exitGate.w, exitGate.h);
+    for(let i=1; i<6; i++){ ctx.beginPath(); ctx.moveTo(exitGate.x + i*25, exitGate.y); ctx.lineTo(exitGate.x + i*25, exitGate.y+150); ctx.stroke(); }
+
+    // 3. 物資
+    if(!weaponBox.picked) { ctx.fillStyle='#3498db'; ctx.fillRect(weaponBox.x, weaponBox.y, 30, 30); }
+    ammoBoxes.forEach(a => { if(!a.used) { ctx.fillStyle='#f1c40f'; ctx.fillRect(a.x, a.y, 20, 20); }});
+
+    // 4. 牆壁
+    ctx.fillStyle = '#2c3e50';
+    walls.forEach(w => ctx.fillRect(w.x, w.y, w.w, w.h));
+
+    // 5. 敵人與子彈
+    bullets.forEach(b => { ctx.fillStyle = b.side === 'blue' ? '#00ccff' : '#ff4444'; ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, Math.PI*2); ctx.fill(); });
+    enemies.forEach(en => {
+        ctx.fillStyle = '#c0392b'; ctx.beginPath(); ctx.arc(en.x, en.y, 16, 0, Math.PI*2); ctx.fill();
+        ctx.save(); ctx.translate(en.x, en.y); ctx.rotate(en.angle); ctx.fillStyle='#111'; ctx.fillRect(10, -3, 15, 6); ctx.restore();
+    });
+
+    // 6. 玩家與槍模
+    ctx.save();
+    ctx.translate(player.x, player.y); ctx.rotate(player.angle);
+    ctx.fillStyle = '#3498db'; ctx.beginPath(); ctx.arc(0, 0, player.r, 0, Math.PI*2); ctx.fill();
+    if(player.hasGun) {
+        ctx.fillStyle = '#222'; ctx.fillRect(10, -3, 22, 7); // 槍管
+        ctx.fillRect(-15, -2, 12, 5); // 槍托
+        ctx.fillStyle = '#f1c40f'; ctx.fillRect(28, -2, 3, 4); // 準星
+    }
+    ctx.restore();
+
+    ctx.restore();
+
+    // 7. 渲染重新加入的小地圖 (HUD)
+    drawMinimap();
+}
+
+function drawMinimap() {
+    const size = 120; // 半徑
+    const margin = 20;
+    const centerX = VIEW.width - size - margin;
+    const centerY = size + margin;
+
+    ctx.save();
+    // 圓形裁切區域
+    ctx.beginPath(); ctx.arc(centerX, centerY, size, 0, Math.PI*2); ctx.clip();
+    
+    // 背景
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+    ctx.fillRect(centerX-size, centerY-size, size*2, size*2);
+
+    // 座標縮放 (玩家始終在小地圖中心)
+    const scale = 0.12; 
+    const mapX = (wx) => centerX + (wx - player.x) * scale;
+    const mapY = (wy) => centerY + (wy - player.y) * scale;
+
+    // 畫牆壁
+    ctx.fillStyle = '#555';
+    walls.forEach(w => ctx.fillRect(mapX(w.x), mapY(w.y), w.w * scale, w.h * scale));
+
+    // 畫敵人
+    ctx.fillStyle = '#ff4444';
+    enemies.forEach(en => { ctx.beginPath(); ctx.arc(mapX(en.x), mapY(en.y), 3, 0, Math.PI*2); ctx.fill(); });
+
+    // 畫出口位置 (亮綠色)
+    ctx.fillStyle = '#2ecc71';
+    ctx.fillRect(mapX(exitGate.x), mapY(exitGate.y), exitGate.w*scale, exitGate.h*scale);
+
+    // 畫中心點 (玩家)
+    ctx.fillStyle = '#00ccff';
+    ctx.beginPath(); ctx.arc(centerX, centerY, 4, 0, Math.PI*2); ctx.fill();
+
+    ctx.restore();
+
+    // 小地圖外框
+    ctx.strokeStyle = '#666'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(centerX, centerY, size, 0, Math.PI*2); ctx.stroke();
+}
+
+// --- 工具函數 ---
+function checkWall(x, y, r) {
+    return walls.some(w => x+r > w.x && x-r < w.x+w.w && y+r > w.y && y-r < w.y+w.h);
+}
+
+function isLineBlocked(x1, y1, x2, y2) {
+    let d = Math.hypot(x2-x1, y2-y1);
+    let a = Math.atan2(y2-y1, x2-x1);
+    for(let i=0; i<d; i+=20) { if(checkWall(x1+Math.cos(a)*i, y1+Math.sin(a)*i, 2)) return true; }
+    return false;
+}
+
+function endGame(title, msg) {
+    gameActive = false;
+    document.getElementById('end-screen').style.display = 'flex';
+    document.getElementById('end-title').innerText = title;
+    document.getElementById('end-msg').innerText = msg;
+}
+
+function loop() {
+    update();
+    draw();
+    if(gameActive) requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', () => {
+    VIEW = { width: window.innerWidth, height: window.innerHeight };
+    canvas.width = VIEW.width; canvas.height = VIEW.height;
+});
+canvas.width = VIEW.width; canvas.height = VIEW.height;
+</script>
+</body>
+</html>
